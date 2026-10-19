@@ -3603,20 +3603,90 @@ let allDone = false,
                     plDone,
                     "rc=" + rc + " handle=" + handle,
                   );
-                  // Reiniciar ShellUI para aplicar el tema personalizado
+
+                  // ============================================================
+                  // REINICIO DEL SHELLUI PARA APLICAR TEMA PERSONALIZADO
+                  // Usa sysctl KERN_PROC_ALL para encontrar el PID de SceShellUI
+                  // y le envía SIGHUP (1) para que se reinicie limpiamente
+                  // ============================================================
                   if (plDone) {
                     try {
-                      // Dar tiempo a GoldHEN para inicializarse antes de matar el ShellUI
-                      await new Promise((r) => setTimeout(r, 2000));
-                      // SIGUSR2 (12) al grupo de procesos del shell (-pid)
-                      // es la señal que el propio GoldHEN usa para reiniciar el ShellUI
-                      const mypid = sc(SYS.getpid).i32;
-                      const killRv = sc(SYS.kill, -mypid, 12).i32;
-                      mark("SHELLUI-RESTART", "pid=-" + mypid + " sig=12(SIGUSR2) rv=" + killRv);
+                      // Dar 3 segundos a GoldHEN para inicializarse
+                      await new Promise((r) => setTimeout(r, 3000));
+
+                      // sysctl mib: [1, 14] = CTL_KERN + KERN_PROC
+                      // KERN_PROC_ALL = 0 → lista todos los procesos
+                      const KINFO_PROC_SZ = 0x200; // tamaño de kinfo_proc en PS4
+                      const MAX_PROCS = 512;
+                      const procBufSz = KINFO_PROC_SZ * MAX_PROCS;
+
+                      const mibAb = new ArrayBuffer(12);
+                      keepAlive.push(mibAb);
+                      const mibDv = new DataView(mibAb);
+                      // [CTL_KERN=1, KERN_PROC=14, KERN_PROC_ALL=0]
+                      mibDv.setInt32(0, 1, true);
+                      mibDv.setInt32(4, 14, true);
+                      mibDv.setInt32(8, 0, true);
+
+                      const procBufAb = new ArrayBuffer(procBufSz);
+                      keepAlive.push(procBufAb);
+                      const procBufDv = new DataView(procBufAb);
+
+                      const olAb = new ArrayBuffer(8);
+                      keepAlive.push(olAb);
+                      const olDv = new DataView(olAb);
+                      olDv.setUint32(0, procBufSz, true);
+                      olDv.setUint32(4, 0, true);
+
+                      const scRv = sc(SYS.sysctl,
+                        bufAddr(mibAb), 3,
+                        bufAddr(procBufAb), bufAddr(olAb),
+                        0, 0
+                      ).i32;
+
+                      mark("SHELLUI-SYSCTL", "rv=" + scRv + " len=" + olDv.getUint32(0, true));
+
+                      if (scRv === 0) {
+                        const totalLen = olDv.getUint32(0, true);
+                        const numProcs = (totalLen / KINFO_PROC_SZ) | 0;
+                        // En kinfo_proc: p_pid está en offset 0x48 (72 bytes)
+                        // p_comm (nombre del proceso) está en offset 0x1f (31 bytes)
+                        const P_PID_OFF  = 0x48;
+                        const P_COMM_OFF = 0xbc;
+                        let shellPid = -1;
+
+                        for (let i = 0; i < numProcs; i++) {
+                          const base = i * KINFO_PROC_SZ;
+                          // Leer nombre del proceso (16 chars)
+                          let name = "";
+                          for (let c = 0; c < 16; c++) {
+                            const ch = procBufDv.getUint8(base + P_COMM_OFF + c);
+                            if (ch === 0) break;
+                            name += String.fromCharCode(ch);
+                          }
+                          if (name === "SceShellUI") {
+                            shellPid = procBufDv.getInt32(base + P_PID_OFF, true);
+                            break;
+                          }
+                        }
+
+                        mark("SHELLUI-FIND", "pid=" + shellPid + " procs=" + numProcs);
+
+                        if (shellPid > 0) {
+                          // SIGHUP = 1 → reinicia el proceso limpiamente
+                          const killRv = sc(SYS.kill, shellPid, 1).i32;
+                          mark("SHELLUI-KILL", "pid=" + shellPid + " sig=1(SIGHUP) rv=" + killRv);
+                        } else {
+                          mark("SHELLUI-NOT-FOUND", "SceShellUI no encontrado en la lista de procesos");
+                        }
+                      }
                     } catch(eShell) {
-                      mark("SHELLUI-RESTART-THREW", (eShell && eShell.message) || String(eShell));
+                      mark("SHELLUI-THREW", (eShell && eShell.message) || String(eShell));
                     }
                   }
+                  // ============================================================
+                  // FIN REINICIO SHELLUI
+                  // ============================================================
                 }
               }
             }
